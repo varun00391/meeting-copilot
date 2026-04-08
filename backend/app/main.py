@@ -16,7 +16,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Meeting Copilot API",
-    description="Live meeting transcription and AI reply suggestions via Groq.",
+    description="Live meeting transcription (Deepgram) and AI reply suggestions (Groq).",
     version="1.0.0",
     lifespan=lifespan,
 )

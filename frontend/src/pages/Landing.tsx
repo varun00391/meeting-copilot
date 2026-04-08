@@ -9,7 +9,7 @@ export function Landing() {
 
       <section className="relative mx-auto max-w-6xl px-4 pb-24 pt-16 sm:px-6 sm:pt-24">
         <p className="mb-4 inline-flex items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium text-slate-300">
-          Groq-powered · Live assist
+          Deepgram + Groq · Live assist
         </p>
         <h1 className="font-display max-w-3xl text-4xl font-bold leading-tight tracking-tight text-white sm:text-5xl lg:text-6xl">
           Answer tough meeting questions{" "}
@@ -56,7 +56,7 @@ export function Landing() {
             {
               step: "02",
               title: "Transcribe",
-              body: "Chunks stream to the backend and Groq Whisper turns speech into text, appended to your live transcript.",
+              body: "Chunks go to the backend; Deepgram transcribes with diarization so you can see who spoke, appended to your live transcript.",
             },
             {
               step: "03",
@@ -85,8 +85,8 @@ export function Landing() {
               </h2>
               <p className="mt-3 max-w-xl text-slate-400">
                 You control when recording runs. Transcripts stay in your session until you clear
-                them. Token usage is logged locally on the server for the dashboard—your Groq key
-                stays on the backend.
+                them. Usage is logged locally on the server for the dashboard—API keys stay on the
+                backend.
               </p>
             </div>
             <Link

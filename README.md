@@ -1,8 +1,8 @@
 # Meeting Copilot
 
-A small full-stack app that listens to meeting audio in the browser, transcribes it with **Groq Whisper**, and uses a **Groq LLM** to suggest concise replies you can read aloud when someone asks a question or expects a response.
+A small full-stack app that listens to meeting audio in the browser, transcribes it with **Deepgram** (including **speaker diarization**), and uses a **Groq LLM** to suggest concise replies you can read aloud when someone asks a question or expects a response.
 
-- **Backend:** Python 3.12, FastAPI, SQLAlchemy (SQLite), Groq SDK  
+- **Backend:** Python 3.12, FastAPI, SQLAlchemy (SQLite), Deepgram + Groq SDKs  
 - **Frontend:** React (Vite), Tailwind CSS, Recharts (usage chart)  
 - **Deployment:** Separate Dockerfiles plus `docker-compose.yml`
 
@@ -15,7 +15,8 @@ A small full-stack app that listens to meeting audio in the browser, transcribes
 
 ## Prerequisites
 
-- [Groq API key](https://console.groq.com/)  
+- [Groq API key](https://console.groq.com/) (chat / suggestions)  
+- [Deepgram API key](https://console.deepgram.com/) (speech-to-text)  
 - For local dev: Node 20+ and Python 3.12+  
 - For Docker: Docker and Docker Compose
 
@@ -29,6 +30,7 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 export GROQ_API_KEY="your-key"
+export DEEPGRAM_API_KEY="your-deepgram-key"
 mkdir -p data
 export DATABASE_URL="sqlite+aiosqlite:///./data/usage.db"
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
@@ -50,7 +52,7 @@ From the repo root:
 
 ```bash
 cp .env.example .env
-# Edit .env and set GROQ_API_KEY
+# Edit .env and set GROQ_API_KEY and DEEPGRAM_API_KEY
 
 docker compose up --build
 ```
@@ -64,10 +66,11 @@ Nginx serves the React app and proxies `/api/*` to the backend container.
 
 | Variable | Description |
 |----------|-------------|
-| `GROQ_API_KEY` | Required for transcription and chat. |
+| `GROQ_API_KEY` | Required for chat / suggested replies. |
+| `DEEPGRAM_API_KEY` | Required for transcription (with diarization). |
 | `DATABASE_URL` | Optional; default is SQLite under `./data` (local) or `/app/data` (Docker). |
 | `CORS_ORIGINS` | Comma-separated origins for direct browser access to the API (dev). |
-| `WHISPER_MODEL` / `CHAT_MODEL` | Optional overrides (see `backend/app/config.py`). |
+| `DEEPGRAM_MODEL` / `CHAT_MODEL` | Optional overrides (see `backend/app/config.py`). |
 
 Frontend: `VITE_API_URL` — leave empty for same-origin `/api` (Docker/nginx). Set to `http://localhost:8000` only if you serve the UI without the proxy.
 
@@ -76,7 +79,7 @@ Frontend: `VITE_API_URL` — leave empty for same-origin `/api` (Docker/nginx). 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/api/health` | Liveness check |
-| `POST` | `/api/transcribe` | Multipart file field `file` → `{ "text": "..." }` |
+| `POST` | `/api/transcribe` | Multipart `file` → `{ "text", "utterances", "duration_sec" }` |
 | `POST` | `/api/suggest` | JSON `{ "transcript": "...", "context": null }` → `{ "suggestion": "..." }` |
 | `GET` | `/api/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD` | Aggregated usage (UTC days) |
 
@@ -84,7 +87,7 @@ Frontend: `VITE_API_URL` — leave empty for same-origin `/api` (Docker/nginx). 
 
 - **Second device:** The UI runs in a browser; open it on the device whose microphone picks up the meeting (for example, placed near speakers). You can also paste transcript text from elsewhere.  
 - **HTTPS:** Browsers require a secure context for `getUserMedia` except on `localhost`. Use HTTPS in production.  
-- **Limits:** Groq enforces audio size limits; very long meetings should use shorter chunk intervals or external recording workflows.
+- **Limits:** Deepgram prerecorded supports large files; the app still sends short chunks for live UX. See Deepgram docs for per-request timeouts on very long single uploads.
 
 ## License
 

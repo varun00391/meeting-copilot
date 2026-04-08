@@ -1,19 +1,27 @@
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
+from deepgram import DeepgramApiError
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.config import settings
 from app.database import get_db
-from app.services import groq_service
+from app.services import deepgram_service, groq_service
 
 router = APIRouter(prefix="/api", tags=["copilot"])
 
 
 class SuggestBody(BaseModel):
     transcript: str = Field(..., min_length=1, max_length=200_000)
-    context: str | None = Field(None, max_length=20_000)
+    context: str | None = Field(
+        None,
+        max_length=20_000,
+        description=(
+            "User's situation, goals (e.g. salary target), tone, and what kind of suggested "
+            "replies they want; steers the LLM while the transcript supplies facts."
+        ),
+    )
 
 
 class SuggestResponse(BaseModel):
@@ -31,29 +39,33 @@ async def transcribe(
     if len(raw) > 24 * 1024 * 1024:
         raise HTTPException(413, "Audio file too large (max ~24MB)")
     try:
-        text, usage = await run_in_threadpool(
-            groq_service.transcribe_audio_sync, raw, file.filename
+        text, utterances, duration_sec = await run_in_threadpool(
+            deepgram_service.transcribe_diarized_sync,
+            raw,
+            content_type=file.content_type,
         )
     except ValueError as e:
         raise HTTPException(503, str(e)) from e
+    except DeepgramApiError as e:
+        raise HTTPException(502, f"Transcription failed: {e}") from e
     except Exception as e:
         raise HTTPException(502, f"Transcription failed: {e!s}") from e
 
-    pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-    ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    tt = int(usage.get("total_tokens") or pt + ct)
-    if tt == 0 and text:
-        tt = max(1, len(text) // 4)
-        pt = tt
+    # Log audio duration (ms) in total_tokens for rough volume tracking vs Groq token rows.
+    audio_ms = max(1, int(round(duration_sec * 1000))) if duration_sec > 0 else max(1, len(text) // 4)
     await groq_service.log_usage(
         db,
         endpoint="transcribe",
-        model=settings.whisper_model,
-        input_tokens=pt,
-        output_tokens=ct,
-        total_tokens=tt,
+        model=settings.deepgram_model,
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=audio_ms,
     )
-    return {"text": text}
+    return {
+        "text": text,
+        "utterances": utterances,
+        "duration_sec": duration_sec,
+    }
 
 
 @router.post("/suggest", response_model=SuggestResponse)

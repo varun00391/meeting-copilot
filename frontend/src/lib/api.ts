@@ -5,7 +5,15 @@ export function apiUrl(path: string): string {
   return `${base}${p}`;
 }
 
-export async function transcribeAudio(blob: Blob, filename: string): Promise<{ text: string }> {
+export type TranscribeUtterance = { speaker: number; transcript: string };
+
+export type TranscribeResponse = {
+  text: string;
+  utterances: TranscribeUtterance[];
+  duration_sec: number;
+};
+
+export async function transcribeAudio(blob: Blob, filename: string): Promise<TranscribeResponse> {
   const form = new FormData();
   form.append("file", blob, filename);
   const res = await fetch(apiUrl("/api/transcribe"), {
@@ -53,6 +61,45 @@ export type UsageSummary = {
 export async function fetchUsageSummary(start: string, end: string): Promise<UsageSummary> {
   const q = new URLSearchParams({ start, end });
   const res = await fetch(apiUrl(`/api/usage/summary?${q}`));
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export type UsageWindow = "30m" | "1h" | "6h" | "12h" | "1d" | "1w";
+
+export type ModelEndpointUsage = {
+  model: string;
+  endpoint: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+};
+
+export type UsageReport = {
+  window: string;
+  window_label: string;
+  window_start_utc: string;
+  window_end_utc: string;
+  explanation: string[];
+  llm: {
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    combined_tokens: number;
+  };
+  transcription: {
+    requests: number;
+    audio_ms: number;
+    audio_minutes: number;
+  };
+  total_requests: number;
+  by_model: ModelEndpointUsage[];
+};
+
+export async function fetchUsageReport(window: UsageWindow): Promise<UsageReport> {
+  const q = new URLSearchParams({ window });
+  const res = await fetch(apiUrl(`/api/usage/report?${q}`));
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

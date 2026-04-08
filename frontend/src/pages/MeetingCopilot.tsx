@@ -8,8 +8,20 @@ type CaptureInfo = {
   hasTabAudio: boolean;
 };
 
-const SUGGEST_DEBOUNCE_MS = 500;
-const RECORD_SLICE_MS = 5500;
+/** Full MediaRecorder segments (valid files for the API), every N ms. */
+const RECORD_SEGMENT_MS = 10_000;
+
+const SUGGEST_DEBOUNCE_MS = 400;
+
+/** Separates prepended transcript segments so we can reorder oldest→newest for the LLM. */
+const TRANSCRIPT_SEGMENT_SEP = "\n\n---\n\n";
+
+function toChronologicalForModel(displayTranscript: string): string {
+  const t = displayTranscript.trim();
+  if (!t) return "";
+  if (!t.includes(TRANSCRIPT_SEGMENT_SEP)) return t;
+  return t.split(TRANSCRIPT_SEGMENT_SEP).filter(Boolean).reverse().join("\n\n");
+}
 
 function extensionForRecorderMime(mime: string): string {
   if (mime.includes("mp4")) return "mp4";
@@ -21,7 +33,10 @@ function extensionForRecorderMime(mime: string): string {
 export function MeetingCopilot() {
   const [status, setStatus] = useState<Status>("idle");
   const [transcript, setTranscript] = useState("");
-  const [suggestion, setSuggestion] = useState("");
+  /** Newest suggestion first; each entry is timestamp + body. */
+  const [suggestionFeed, setSuggestionFeed] = useState<string[]>([]);
+  const [latestSuggestionText, setLatestSuggestionText] = useState("");
+  const [notes, setNotes] = useState("");
   const [context, setContext] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -43,16 +58,9 @@ export function MeetingCopilot() {
   transcriptRef.current = transcript;
   contextRef.current = context;
 
-  const appendLine = useCallback((line: string) => {
-    if (!line.trim()) return;
-    const next = transcriptRef.current ? `${transcriptRef.current}\n${line.trim()}` : line.trim();
-    transcriptRef.current = next;
-    setTranscript(next);
-    return next;
-  }, []);
-
   const runSuggest = useCallback(async (textOverride?: string) => {
-    const t = (textOverride ?? transcriptRef.current).trim();
+    const display = (textOverride ?? transcriptRef.current).trim();
+    const t = toChronologicalForModel(display).trim();
     if (!t) {
       setError("Nothing to analyze yet—wait for transcript lines or paste text.");
       return;
@@ -61,7 +69,10 @@ export function MeetingCopilot() {
     setError(null);
     try {
       const { suggestion: s } = await suggestReply(t, contextRef.current || undefined);
-      setSuggestion(s);
+      const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const block = `[${stamp}]\n\n${s.trim()}`;
+      setLatestSuggestionText(s.trim());
+      setSuggestionFeed((prev) => [block, ...prev]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Suggestion failed");
     } finally {
@@ -85,15 +96,29 @@ export function MeetingCopilot() {
       if (blob.size < 200) return;
       const ext = extensionForRecorderMime(blob.type || recorderMimeRef.current);
       try {
-        const { text } = await transcribeAudio(blob, `segment.${ext}`);
-        if (!text?.trim()) return;
-        const next = appendLine(text);
-        if (next) scheduleLiveSuggest(next);
+        const res = await transcribeAudio(blob, `segment.${ext}`);
+        const lines: string[] = [];
+        if (res.utterances?.length) {
+          for (const u of res.utterances) {
+            const t = u.transcript?.trim();
+            if (t) lines.push(`Speaker ${u.speaker}: ${t}`);
+          }
+        } else if (res.text?.trim()) {
+          lines.push(res.text.trim());
+        }
+        if (!lines.length) return;
+        const block = lines.join("\n").trim();
+        const next = transcriptRef.current
+          ? `${block}${TRANSCRIPT_SEGMENT_SEP}${transcriptRef.current}`
+          : block;
+        transcriptRef.current = next;
+        setTranscript(next);
+        scheduleLiveSuggest(next);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Transcription failed");
       }
     },
-    [appendLine, scheduleLiveSuggest]
+    [scheduleLiveSuggest]
   );
 
   const beginSegment = useCallback(() => {
@@ -132,7 +157,7 @@ export function MeetingCopilot() {
           /* ignore */
         }
       }
-    }, RECORD_SLICE_MS);
+    }, RECORD_SEGMENT_MS);
   }, [processBlob]);
 
   const cleanupStreams = useCallback(() => {
@@ -260,15 +285,62 @@ export function MeetingCopilot() {
 
   useEffect(() => {
     const el = document.getElementById("live-transcript") as HTMLTextAreaElement | null;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
+    if (el) el.scrollTop = 0;
   }, [transcript]);
+
+  useEffect(() => {
+    const el = document.getElementById("live-suggestion-scroll");
+    if (el) el.scrollTop = 0;
+  }, [suggestionFeed]);
 
   const onTranscriptChange = (v: string) => {
     transcriptRef.current = v;
     setTranscript(v);
   };
+
+  const saveTranscript = useCallback(() => {
+    const body = transcriptRef.current.trim();
+    if (!body) return;
+    const d = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const fname = `meeting-transcript-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.txt`;
+    const header = `Meeting Copilot — transcript\nSaved: ${d.toLocaleString()}\n\n`;
+    const blob = new Blob([header + body], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    a.rel = "noopener";
+    a.click();
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const saveNotes = useCallback(() => {
+    const body = notes.trim();
+    if (!body) return;
+    const d = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const fname = `meeting-notes-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.txt`;
+    const header = `Meeting Copilot — notes\nSaved: ${d.toLocaleString()}\n\n`;
+    const blob = new Blob([header + body], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    a.rel = "noopener";
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [notes]);
+
+  const appendSuggestionToNotes = useCallback(() => {
+    const s = latestSuggestionText.trim();
+    if (!s) return;
+    const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const block = `[${stamp}]\n${s}\n\n`;
+    setNotes((n) => (n ? `${n.trimEnd()}\n\n${block}` : block));
+  }, [latestSuggestionText]);
+
+  const suggestionDisplay = suggestionFeed.join("\n\n────────\n\n");
 
   return (
     <div className="flex min-h-[calc(100vh-4.5rem)] flex-col">
@@ -282,17 +354,21 @@ export function MeetingCopilot() {
       />
 
       <div className="border-b border-white/5 bg-ink-950/90 px-4 py-4 sm:px-6">
-        <div className="mx-auto flex max-w-[1600px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div className="mx-auto flex max-w-[1920px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <h1 className="font-display text-2xl font-bold text-white sm:text-3xl">
               Live meeting copilot
             </h1>
-            <p className="mt-1 max-w-2xl text-sm text-slate-400">
-              Mic captures you; when you share your screen, choose the{" "}
-              <strong className="font-medium text-slate-300">meeting tab</strong> and enable{" "}
-              <strong className="font-medium text-slate-300">Share tab audio</strong> so remote
-              voices are included. After each transcribed segment, a suggested reply updates
-              automatically on the right.
+            <p className="mt-1 max-w-3xl text-sm text-slate-400">
+              Mic + optional meeting tab audio (share tab with audio). Audio is captured in{" "}
+              <strong className="font-medium text-slate-300">10-second</strong> segments, transcribed
+              (Deepgram when configured), then a debounced suggestion prepends in the middle column
+              (newest on top). Transcript does the same: newest auto-captured segments at the top,
+              older below.
+              Use <strong className="font-medium text-slate-300">Live notes</strong> for your own
+              running capture—append the latest suggestion if useful. Fill{" "}
+              <strong className="font-medium text-slate-300">Your meeting briefing</strong> below
+              so suggestions match your situation and the kind of answers you want.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -316,12 +392,12 @@ export function MeetingCopilot() {
             <span
               className={`text-sm ${status === "listening" ? "text-emerald-400" : "text-slate-500"}`}
             >
-              {status === "listening" ? "● Live" : "○ Idle"}
+              {status === "listening" ? `● Live · ${RECORD_SEGMENT_MS / 1000}s segments` : "○ Idle"}
             </span>
             {captureInfo && status === "listening" && (
               <span className="text-xs text-slate-500">
                 Mic on
-                {captureInfo.hasTabAudio ? " · Tab audio on" : " · Tab audio off (share meeting tab with audio)"}
+                {captureInfo.hasTabAudio ? " · Tab audio on" : " · Tab audio off"}
               </span>
             )}
             <button
@@ -335,57 +411,82 @@ export function MeetingCopilot() {
           </div>
         </div>
 
-        <div className="mx-auto mt-4 max-w-[1600px]">
-          <label className="block text-xs font-medium uppercase tracking-wide text-slate-500">
-            Your context (optional)
+        <div className="mx-auto mt-4 max-w-[1920px]">
+          <div className="rounded-xl border border-white/10 bg-ink-900/50 p-4 lg:max-w-4xl">
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Your meeting briefing
+              <span className="ml-2 font-normal normal-case text-slate-500">(optional but recommended)</span>
+            </label>
+            <p className="mt-2 text-sm text-slate-400">
+              Describe your <strong className="font-medium text-slate-300">situation</strong> (who,
+              what meeting, what is at stake) and{" "}
+              <strong className="font-medium text-slate-300">what you want from the AI</strong>—tone
+              (e.g. firm but polite), tactics (anchor salary, ask for time, deflect), and any
+              numbers or limits (e.g. target package). Live suggestions use this together with the
+              transcript.
+            </p>
             <textarea
               value={context}
               onChange={(e) => setContext(e.target.value)}
-              placeholder="Role, goals, constraints—helps tailor live suggestions…"
-              rows={2}
-              className="mt-1.5 w-full rounded-xl border border-white/10 bg-ink-900/80 px-4 py-2.5 text-sm text-white placeholder:text-slate-600 focus:border-accent/50 focus:outline-none focus:ring-1 focus:ring-accent/40 lg:max-w-3xl"
+              placeholder={
+                "Example:\n" +
+                "HR discussion about joining and compensation. I want to aim for 30 LPA and stay professional if they start lower. Help me with short lines I can say, good questions to ask about breakdown (base/bonus/equity), and how to pause or follow up if needed—not aggressive, credible."
+              }
+              rows={5}
+              className="mt-3 w-full rounded-lg border border-white/10 bg-ink-950/80 px-4 py-3 text-sm leading-relaxed text-white placeholder:text-slate-600 focus:border-accent/50 focus:outline-none focus:ring-1 focus:ring-accent/40"
             />
-          </label>
+          </div>
         </div>
 
         {error && (
-          <div className="mx-auto mt-4 max-w-[1600px] rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          <div className="mx-auto mt-4 max-w-[1920px] rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
             {error}
           </div>
         )}
       </div>
 
-      <div className="mx-auto flex min-h-0 w-full max-w-[1600px] flex-1 flex-col gap-0 lg:flex-row">
-        <section className="flex min-h-[min(50vh,28rem)] flex-1 flex-col border-white/5 lg:min-h-0 lg:border-r">
+      <div className="mx-auto grid min-h-0 w-full max-w-[1920px] flex-1 grid-cols-1 gap-0 border-t border-white/5 lg:grid-cols-3 lg:items-stretch">
+        <section className="flex min-h-[min(40vh,22rem)] flex-col border-white/5 lg:min-h-0 lg:border-r">
           <div className="flex items-center justify-between border-b border-white/5 px-4 py-3 sm:px-5">
             <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
               Live transcript
             </h2>
-            <button
-              type="button"
-              onClick={() => {
-                transcriptRef.current = "";
-                setTranscript("");
-                setSuggestion("");
-              }}
-              className="text-xs text-slate-500 hover:text-slate-300"
-            >
-              Clear
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={!transcript.trim()}
+                onClick={saveTranscript}
+                className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  transcriptRef.current = "";
+                  setTranscript("");
+                  setSuggestionFeed([]);
+                  setLatestSuggestionText("");
+                }}
+                className="text-xs text-slate-500 hover:text-slate-300"
+              >
+                Clear
+              </button>
+            </div>
           </div>
           <textarea
             id="live-transcript"
             value={transcript}
             onChange={(e) => onTranscriptChange(e.target.value)}
             className="min-h-0 flex-1 resize-none border-0 bg-ink-950/50 px-4 py-4 font-mono text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
-            placeholder="You + remote participants (via tab audio) appear here as speech is transcribed…"
+            placeholder="Newest transcript segments appear at the top (older below). Separator --- between auto-captured segments."
           />
         </section>
 
-        <section className="flex min-h-[min(50vh,28rem)] flex-1 flex-col lg:min-h-0">
+        <section className="flex min-h-[min(40vh,22rem)] flex-col border-white/5 lg:min-h-0 lg:border-r">
           <div className="flex items-center justify-between border-b border-white/5 px-4 py-3 sm:px-5">
             <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
-              Suggested reply
+              Live suggestion
               {busy && (
                 <span className="ml-2 font-sans text-xs font-normal normal-case text-accent-glow">
                   updating…
@@ -393,18 +494,61 @@ export function MeetingCopilot() {
               )}
             </h2>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-indigo-500/[0.06] to-ink-950 px-4 py-4 sm:px-5">
-            {suggestion ? (
+          <div
+            id="live-suggestion-scroll"
+            className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-indigo-500/[0.06] to-ink-950 px-4 py-4 sm:px-5"
+          >
+            {suggestionDisplay ? (
               <div className="whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
-                {suggestion}
+                {suggestionDisplay}
               </div>
             ) : (
               <p className="text-sm text-slate-600">
-                Start listening. As new speech is transcribed, this panel refreshes with a reply you
-                can read aloud—tailored to the latest conversation.
+                Suggestions appear after each transcribed segment (newest at top, older below),
+                grounded in the transcript and your meeting briefing when you fill it in.
               </p>
             )}
           </div>
+        </section>
+
+        <section className="flex min-h-[min(40vh,22rem)] flex-col lg:min-h-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 px-4 py-3 sm:px-5">
+            <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
+              Live notes
+            </h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={!latestSuggestionText.trim()}
+                onClick={appendSuggestionToNotes}
+                className="rounded-lg border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent-glow hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Append suggestion
+              </button>
+              <button
+                type="button"
+                disabled={!notes.trim()}
+                onClick={saveNotes}
+                className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={() => setNotes("")}
+                className="text-xs text-slate-500 hover:text-slate-300"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <textarea
+            id="live-notes"
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            className="min-h-0 flex-1 resize-none border-0 bg-ink-900/40 px-4 py-4 text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
+            placeholder="Your running notes: decisions, follow-ups, risks… Use “Append suggestion” to snapshot the current reply with a timestamp."
+          />
         </section>
       </div>
     </div>
