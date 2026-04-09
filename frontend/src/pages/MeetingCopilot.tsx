@@ -41,6 +41,7 @@ export function MeetingCopilot() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [captureInfo, setCaptureInfo] = useState<CaptureInfo | null>(null);
+  const [briefingOpen, setBriefingOpen] = useState(false);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const listeningRef = useRef(false);
@@ -343,7 +344,7 @@ export function MeetingCopilot() {
   const suggestionDisplay = suggestionFeed.join("\n\n────────\n\n");
 
   return (
-    <div className="flex min-h-[calc(100vh-4.5rem)] flex-col">
+    <div className="flex h-[calc(100dvh-4.5rem)] min-h-[420px] flex-row bg-ink-950">
       <video
         ref={hiddenVideoRef}
         className="pointer-events-none fixed left-0 top-0 h-px w-px opacity-0"
@@ -353,102 +354,143 @@ export function MeetingCopilot() {
         aria-hidden
       />
 
-      <div className="border-b border-white/5 bg-ink-950/90 px-4 py-4 sm:px-6">
-        <div className="mx-auto flex max-w-[1920px] flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <h1 className="font-display text-2xl font-bold text-white sm:text-3xl">
+      {/* Collapsible briefing sidebar */}
+      <aside
+        className={`flex shrink-0 flex-col border-r border-white/10 bg-ink-900/50 transition-[width] duration-200 ease-out ${
+          briefingOpen ? "w-[min(100vw,20rem)] sm:w-[22rem]" : "w-11 sm:w-12"
+        }`}
+      >
+        {briefingOpen ? (
+          <>
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
+              <span className="font-display text-xs font-semibold uppercase tracking-wide text-slate-300">
+                Your meeting briefing
+              </span>
+              <button
+                type="button"
+                onClick={() => setBriefingOpen(false)}
+                className="rounded-lg px-2 py-1 text-sm text-slate-400 hover:bg-white/10 hover:text-white"
+                aria-label="Collapse meeting briefing"
+              >
+                ⟨
+              </button>
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+              <p className="text-xs leading-relaxed text-slate-400">
+                Describe your situation and what you want from the AI (tone, tactics, numbers).
+                Suggestions use this with the transcript.
+              </p>
+              <label className="sr-only" htmlFor="meeting-briefing-text">
+                Meeting briefing details
+              </label>
+              <textarea
+                id="meeting-briefing-text"
+                value={context}
+                onChange={(e) => setContext(e.target.value)}
+                placeholder={
+                  "Example:\n" +
+                  "HR discussion about joining and compensation. I want to aim for 30 LPA and stay professional if they start lower. Help me with short lines I can say, good questions about breakdown (base/bonus/equity), and how to pause or follow up—not aggressive, credible."
+                }
+                className="min-h-[200px] flex-1 resize-y rounded-lg border border-white/10 bg-ink-950/90 px-3 py-2.5 text-sm leading-relaxed text-white placeholder:text-slate-600 focus:border-accent/50 focus:outline-none focus:ring-1 focus:ring-accent/40"
+              />
+            </div>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setBriefingOpen(true)}
+            className="flex min-h-0 flex-1 flex-col items-center gap-3 bg-ink-900/30 py-6 text-slate-500 hover:bg-white/[0.06] hover:text-slate-200"
+            aria-label="Open meeting briefing sidebar"
+          >
+            <span className="text-lg leading-none" aria-hidden>
+              ≡
+            </span>
+            <span className="max-w-[1.25rem] text-center text-[9px] font-bold uppercase leading-tight tracking-tight text-slate-500 [word-break:break-word] sm:text-[10px]">
+              Briefing
+            </span>
+          </button>
+        )}
+      </aside>
+
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* Compact toolbar — keeps transcript / suggestion / notes high on the screen */}
+        <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-white/10 bg-ink-950/95 px-3 py-2 sm:gap-4 sm:px-4">
+          <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h1 className="font-display truncate text-base font-bold text-white sm:text-lg">
               Live meeting copilot
             </h1>
-            <p className="mt-1 max-w-3xl text-sm text-slate-400">
-              Mic + optional meeting tab audio (share tab with audio). Audio is captured in{" "}
-              <strong className="font-medium text-slate-300">10-second</strong> segments, transcribed
-              (Deepgram when configured), then a debounced suggestion prepends in the middle column
-              (newest on top). Transcript does the same: newest auto-captured segments at the top,
-              older below.
-              Use <strong className="font-medium text-slate-300">Live notes</strong> for your own
-              running capture—append the latest suggestion if useful. Fill{" "}
-              <strong className="font-medium text-slate-300">Your meeting briefing</strong> below
-              so suggestions match your situation and the kind of answers you want.
+            <p className="hidden text-xs text-slate-500 xl:inline">
+              Mic + optional tab audio · {RECORD_SEGMENT_MS / 1000}s segments · open{" "}
+              <button
+                type="button"
+                onClick={() => setBriefingOpen(true)}
+                className="text-accent-glow underline decoration-accent/40 underline-offset-2 hover:text-indigo-300"
+              >
+                briefing
+              </button>{" "}
+              for goals and tone
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setBriefingOpen((o) => !o)}
+              className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold sm:px-3 ${
+                briefingOpen
+                  ? "border-accent/40 bg-accent/15 text-accent-glow"
+                  : "border-white/15 bg-white/5 text-slate-300 hover:bg-white/10"
+              }`}
+            >
+              Briefing
+            </button>
             {status !== "listening" ? (
               <button
                 type="button"
                 onClick={() => void start()}
-                className="rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-ink-950 hover:bg-emerald-400"
+                className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-ink-950 hover:bg-emerald-400 sm:px-4 sm:text-sm"
               >
-                Start listening
+                Start
               </button>
             ) : (
               <button
                 type="button"
                 onClick={stop}
-                className="rounded-xl bg-rose-500/90 px-5 py-2.5 text-sm font-semibold text-white hover:bg-rose-500"
+                className="rounded-lg bg-rose-500/90 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-500 sm:px-4 sm:text-sm"
               >
                 Stop
               </button>
             )}
             <span
-              className={`text-sm ${status === "listening" ? "text-emerald-400" : "text-slate-500"}`}
+              className={`text-xs sm:text-sm ${status === "listening" ? "text-emerald-400" : "text-slate-500"}`}
             >
-              {status === "listening" ? `● Live · ${RECORD_SEGMENT_MS / 1000}s segments` : "○ Idle"}
+              {status === "listening" ? `● ${RECORD_SEGMENT_MS / 1000}s` : "○ Idle"}
             </span>
             {captureInfo && status === "listening" && (
-              <span className="text-xs text-slate-500">
-                Mic on
-                {captureInfo.hasTabAudio ? " · Tab audio on" : " · Tab audio off"}
+              <span className="hidden text-xs text-slate-500 sm:inline">
+                {captureInfo.hasTabAudio ? "Tab audio" : "Mic only"}
               </span>
             )}
             <button
               type="button"
               disabled={busy}
               onClick={() => void runSuggest()}
-              className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold text-white hover:bg-white/10 disabled:opacity-50"
+              className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-50 sm:px-3 sm:text-sm"
             >
-              {busy ? "Updating…" : "Refresh suggestion"}
+              {busy ? "…" : "Refresh"}
             </button>
           </div>
-        </div>
-
-        <div className="mx-auto mt-4 max-w-[1920px]">
-          <div className="rounded-xl border border-white/10 bg-ink-900/50 p-4 lg:max-w-4xl">
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-400">
-              Your meeting briefing
-              <span className="ml-2 font-normal normal-case text-slate-500">(optional but recommended)</span>
-            </label>
-            <p className="mt-2 text-sm text-slate-400">
-              Describe your <strong className="font-medium text-slate-300">situation</strong> (who,
-              what meeting, what is at stake) and{" "}
-              <strong className="font-medium text-slate-300">what you want from the AI</strong>—tone
-              (e.g. firm but polite), tactics (anchor salary, ask for time, deflect), and any
-              numbers or limits (e.g. target package). Live suggestions use this together with the
-              transcript.
-            </p>
-            <textarea
-              value={context}
-              onChange={(e) => setContext(e.target.value)}
-              placeholder={
-                "Example:\n" +
-                "HR discussion about joining and compensation. I want to aim for 30 LPA and stay professional if they start lower. Help me with short lines I can say, good questions to ask about breakdown (base/bonus/equity), and how to pause or follow up if needed—not aggressive, credible."
-              }
-              rows={5}
-              className="mt-3 w-full rounded-lg border border-white/10 bg-ink-950/80 px-4 py-3 text-sm leading-relaxed text-white placeholder:text-slate-600 focus:border-accent/50 focus:outline-none focus:ring-1 focus:ring-accent/40"
-            />
-          </div>
-        </div>
+        </header>
 
         {error && (
-          <div className="mx-auto mt-4 max-w-[1920px] rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          <div className="shrink-0 border-b border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-200 sm:px-4">
             {error}
           </div>
         )}
-      </div>
 
-      <div className="mx-auto grid min-h-0 w-full max-w-[1920px] flex-1 grid-cols-1 gap-0 border-t border-white/5 lg:grid-cols-3 lg:items-stretch">
-        <section className="flex min-h-[min(40vh,22rem)] flex-col border-white/5 lg:min-h-0 lg:border-r">
+        <div className="grid min-h-0 flex-1 grid-cols-1 divide-y divide-white/10 lg:grid-cols-3 lg:divide-x lg:divide-y-0">
+        <section className="flex min-h-[11rem] flex-col lg:min-h-0 lg:border-0">
           <div className="flex items-center justify-between border-b border-white/5 px-4 py-3 sm:px-5">
-            <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
+            <h2 className="font-display text-xs font-bold uppercase tracking-wider text-slate-200 sm:text-sm">
               Live transcript
             </h2>
             <div className="flex items-center gap-2">
@@ -483,9 +525,9 @@ export function MeetingCopilot() {
           />
         </section>
 
-        <section className="flex min-h-[min(40vh,22rem)] flex-col border-white/5 lg:min-h-0 lg:border-r">
+        <section className="flex min-h-[11rem] flex-col lg:min-h-0">
           <div className="flex items-center justify-between border-b border-white/5 px-4 py-3 sm:px-5">
-            <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
+            <h2 className="font-display text-xs font-bold uppercase tracking-wider text-slate-200 sm:text-sm">
               Live suggestion
               {busy && (
                 <span className="ml-2 font-sans text-xs font-normal normal-case text-accent-glow">
@@ -511,9 +553,9 @@ export function MeetingCopilot() {
           </div>
         </section>
 
-        <section className="flex min-h-[min(40vh,22rem)] flex-col lg:min-h-0">
+        <section className="flex min-h-[11rem] flex-col lg:min-h-0">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 px-4 py-3 sm:px-5">
-            <h2 className="font-display text-sm font-semibold uppercase tracking-wide text-slate-400">
+            <h2 className="font-display text-xs font-bold uppercase tracking-wider text-slate-200 sm:text-sm">
               Live notes
             </h2>
             <div className="flex flex-wrap items-center gap-2">
@@ -550,6 +592,7 @@ export function MeetingCopilot() {
             placeholder="Your running notes: decisions, follow-ups, risks… Use “Append suggestion” to snapshot the current reply with a timestamp."
           />
         </section>
+        </div>
       </div>
     </div>
   );

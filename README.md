@@ -58,30 +58,34 @@ docker compose up --build
 ```
 
 - **Frontend (with API proxy):** [http://localhost:8080](http://localhost:8080)  
-- **Backend (direct):** [http://localhost:8000/api/health](http://localhost:8000/api/health)  
+- **Backend (direct):** [http://localhost:8000/api/health](http://localhost:8000/api/health)
 
-Nginx serves the React app and proxies `/api/*` to the backend container.
+Nginx serves the React app and proxies `/api/`* to the backend container.
 
 ## Environment variables
 
-| Variable | Description |
-|----------|-------------|
-| `GROQ_API_KEY` | Required for chat / suggested replies. |
-| `DEEPGRAM_API_KEY` | Required for transcription (with diarization). |
-| `DATABASE_URL` | Optional; default is SQLite under `./data` (local) or `/app/data` (Docker). |
-| `CORS_ORIGINS` | Comma-separated origins for direct browser access to the API (dev). |
-| `DEEPGRAM_MODEL` / `CHAT_MODEL` | Optional overrides (see `backend/app/config.py`). |
+
+| Variable                        | Description                                                                 |
+| ------------------------------- | --------------------------------------------------------------------------- |
+| `GROQ_API_KEY`                  | Required for chat / suggested replies.                                      |
+| `DEEPGRAM_API_KEY`              | Required for transcription (with diarization).                              |
+| `DATABASE_URL`                  | Optional; default is SQLite under `./data` (local) or `/app/data` (Docker). |
+| `CORS_ORIGINS`                  | Comma-separated origins for direct browser access to the API (dev).         |
+| `DEEPGRAM_MODEL` / `CHAT_MODEL` | Optional overrides (see `backend/app/config.py`).                           |
+
 
 Frontend: `VITE_API_URL` — leave empty for same-origin `/api` (Docker/nginx). Set to `http://localhost:8000` only if you serve the UI without the proxy.
 
 ## API overview
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/api/health` | Liveness check |
-| `POST` | `/api/transcribe` | Multipart `file` → `{ "text", "utterances", "duration_sec" }` |
-| `POST` | `/api/suggest` | JSON `{ "transcript": "...", "context": null }` → `{ "suggestion": "..." }` |
-| `GET` | `/api/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD` | Aggregated usage (UTC days) |
+
+| Method | Path                                                 | Purpose                                                                     |
+| ------ | ---------------------------------------------------- | --------------------------------------------------------------------------- |
+| `GET`  | `/api/health`                                        | Liveness check                                                              |
+| `POST` | `/api/transcribe`                                    | Multipart `file` → `{ "text", "utterances", "duration_sec" }`               |
+| `POST` | `/api/suggest`                                       | JSON `{ "transcript": "...", "context": null }` → `{ "suggestion": "..." }` |
+| `GET`  | `/api/usage/summary?start=YYYY-MM-DD&end=YYYY-MM-DD` | Aggregated usage (UTC days)                                                 |
+
 
 ## Notes
 
