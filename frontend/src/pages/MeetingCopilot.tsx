@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { answerQuestion, suggestReply, transcribeAudio } from "../lib/api";
 
 type Status = "idle" | "listening" | "error";
@@ -30,14 +32,28 @@ function extensionForRecorderMime(mime: string): string {
   return "webm";
 }
 
+function newQuestionEntryId(): string {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `q-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
+type QuestionEntry = {
+  id: string;
+  stamp: string;
+  question: string;
+  /** Markdown from the model */
+  answer: string;
+};
+
 export function MeetingCopilot() {
   const [status, setStatus] = useState<Status>("idle");
   const [transcript, setTranscript] = useState("");
   /** Newest suggestion first; each entry is timestamp + body. */
   const [suggestionFeed, setSuggestionFeed] = useState<string[]>([]);
   const [questionText, setQuestionText] = useState("");
-  /** Newest answer blocks first (timestamp + question + answer). */
-  const [questionFeed, setQuestionFeed] = useState<string[]>([]);
+  /** Newest entries first. Question is plain text; answer rendered as Markdown. */
+  const [questionFeed, setQuestionFeed] = useState<QuestionEntry[]>([]);
   const [context, setContext] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -344,8 +360,15 @@ export function MeetingCopilot() {
     try {
       const { answer } = await answerQuestion(q, contextRef.current || undefined, sessionIdRef.current);
       const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      const block = `[${stamp}]\n\nQ: ${q}\n\n${answer.trim()}`;
-      setQuestionFeed((prev) => [block, ...prev]);
+      setQuestionFeed((prev) => [
+        {
+          id: newQuestionEntryId(),
+          stamp,
+          question: q,
+          answer: answer.trim(),
+        },
+        ...prev,
+      ]);
       setQuestionText("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not get an answer");
@@ -355,7 +378,6 @@ export function MeetingCopilot() {
   }, [questionText]);
 
   const suggestionDisplay = suggestionFeed.join("\n\n────────\n\n");
-  const questionsDisplay = questionFeed.join("\n\n────────\n\n");
 
   return (
     <div className="flex h-[calc(100dvh-4.5rem)] min-h-[420px] flex-row bg-ink-950">
@@ -631,9 +653,58 @@ export function MeetingCopilot() {
             id="questions-answer-scroll"
             className="min-h-0 flex-1 overflow-y-auto bg-ink-950/80 px-4 py-4 sm:px-5"
           >
-            {questionsDisplay ? (
-              <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-100">
-                {questionsDisplay}
+            {questionFeed.length > 0 ? (
+              <div className="flex flex-col gap-8">
+                {questionFeed.map((entry) => (
+                  <article
+                    key={entry.id}
+                    className="border-b border-white/10 pb-8 last:border-b-0 last:pb-0"
+                  >
+                    <p className="mb-2 font-mono text-xs text-slate-500">[{entry.stamp}]</p>
+                    <p className="mb-3 break-words text-sm text-slate-300">
+                      <span className="font-semibold text-slate-200">Q: </span>
+                      {entry.question}
+                    </p>
+                    <div
+                      className={[
+                        "prose prose-invert prose-sm max-w-none",
+                        "prose-headings:font-display prose-headings:font-semibold prose-headings:tracking-tight",
+                        "prose-p:leading-relaxed prose-li:leading-relaxed",
+                        "prose-pre:bg-ink-900 prose-pre:border prose-pre:border-white/10 prose-pre:rounded-lg",
+                        "prose-code:rounded prose-code:bg-white/[0.08] prose-code:px-1.5 prose-code:py-0.5 prose-code:font-normal prose-code:text-accent-glow",
+                        "prose-code:before:content-none prose-code:after:content-none",
+                        "prose-table:border-collapse prose-th:border prose-th:border-white/15 prose-td:border prose-td:border-white/10",
+                      ].join(" ")}
+                    >
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ href, children, ...props }) => (
+                            <a
+                              href={href}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-accent-glow underline decoration-accent/50 underline-offset-2 hover:text-indigo-300"
+                              {...props}
+                            >
+                              {children}
+                            </a>
+                          ),
+                          pre: ({ children, className, ...props }) => (
+                            <pre
+                              {...props}
+                              className={[className, "overflow-x-auto"].filter(Boolean).join(" ")}
+                            >
+                              {children}
+                            </pre>
+                          ),
+                        }}
+                      >
+                        {entry.answer}
+                      </ReactMarkdown>
+                    </div>
+                  </article>
+                ))}
               </div>
             ) : (
               <p className="text-sm text-slate-600">
