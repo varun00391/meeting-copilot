@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { suggestReply, transcribeAudio } from "../lib/api";
+import { answerQuestion, suggestReply, transcribeAudio } from "../lib/api";
 
 type Status = "idle" | "listening" | "error";
 
@@ -35,11 +35,13 @@ export function MeetingCopilot() {
   const [transcript, setTranscript] = useState("");
   /** Newest suggestion first; each entry is timestamp + body. */
   const [suggestionFeed, setSuggestionFeed] = useState<string[]>([]);
-  const [latestSuggestionText, setLatestSuggestionText] = useState("");
-  const [notes, setNotes] = useState("");
+  const [questionText, setQuestionText] = useState("");
+  /** Newest answer blocks first (timestamp + question + answer). */
+  const [questionFeed, setQuestionFeed] = useState<string[]>([]);
   const [context, setContext] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [questionBusy, setQuestionBusy] = useState(false);
   const [captureInfo, setCaptureInfo] = useState<CaptureInfo | null>(null);
   const [briefingOpen, setBriefingOpen] = useState(false);
 
@@ -54,6 +56,8 @@ export function MeetingCopilot() {
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
   const transcriptRef = useRef("");
   const contextRef = useRef("");
+  /** Server-side conversation session (transcript + briefing); set on Start, cleared on Stop. */
+  const sessionIdRef = useRef<string | null>(null);
   const suggestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   transcriptRef.current = transcript;
@@ -69,10 +73,13 @@ export function MeetingCopilot() {
     setBusy(true);
     setError(null);
     try {
-      const { suggestion: s } = await suggestReply(t, contextRef.current || undefined);
+      const { suggestion: s } = await suggestReply(
+        t,
+        contextRef.current || undefined,
+        sessionIdRef.current
+      );
       const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const block = `[${stamp}]\n\n${s.trim()}`;
-      setLatestSuggestionText(s.trim());
       setSuggestionFeed((prev) => [block, ...prev]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Suggestion failed");
@@ -97,7 +104,7 @@ export function MeetingCopilot() {
       if (blob.size < 200) return;
       const ext = extensionForRecorderMime(blob.type || recorderMimeRef.current);
       try {
-        const res = await transcribeAudio(blob, `segment.${ext}`);
+        const res = await transcribeAudio(blob, `segment.${ext}`, sessionIdRef.current);
         const lines: string[] = [];
         if (res.utterances?.length) {
           for (const u of res.utterances) {
@@ -205,6 +212,7 @@ export function MeetingCopilot() {
   }, []);
 
   const stop = useCallback(() => {
+    sessionIdRef.current = null;
     cleanupStreams();
     setStatus("idle");
   }, [cleanupStreams]);
@@ -277,6 +285,10 @@ export function MeetingCopilot() {
           : "audio/webm";
     recorderMimeRef.current = mime;
 
+    sessionIdRef.current =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `sess-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
     listeningRef.current = true;
     setStatus("listening");
     beginSegment();
@@ -293,6 +305,11 @@ export function MeetingCopilot() {
     const el = document.getElementById("live-suggestion-scroll");
     if (el) el.scrollTop = 0;
   }, [suggestionFeed]);
+
+  useEffect(() => {
+    const el = document.getElementById("questions-answer-scroll");
+    if (el) el.scrollTop = 0;
+  }, [questionFeed]);
 
   const onTranscriptChange = (v: string) => {
     transcriptRef.current = v;
@@ -316,32 +333,29 @@ export function MeetingCopilot() {
     URL.revokeObjectURL(url);
   }, []);
 
-  const saveNotes = useCallback(() => {
-    const body = notes.trim();
-    if (!body) return;
-    const d = new Date();
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    const fname = `meeting-notes-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.txt`;
-    const header = `Meeting Copilot — notes\nSaved: ${d.toLocaleString()}\n\n`;
-    const blob = new Blob([header + body], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = fname;
-    a.rel = "noopener";
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [notes]);
-
-  const appendSuggestionToNotes = useCallback(() => {
-    const s = latestSuggestionText.trim();
-    if (!s) return;
-    const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const block = `[${stamp}]\n${s}\n\n`;
-    setNotes((n) => (n ? `${n.trimEnd()}\n\n${block}` : block));
-  }, [latestSuggestionText]);
+  const runAskQuestion = useCallback(async () => {
+    const q = questionText.trim();
+    if (!q) {
+      setError("Type a question first.");
+      return;
+    }
+    setQuestionBusy(true);
+    setError(null);
+    try {
+      const { answer } = await answerQuestion(q, contextRef.current || undefined, sessionIdRef.current);
+      const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const block = `[${stamp}]\n\nQ: ${q}\n\n${answer.trim()}`;
+      setQuestionFeed((prev) => [block, ...prev]);
+      setQuestionText("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not get an answer");
+    } finally {
+      setQuestionBusy(false);
+    }
+  }, [questionText]);
 
   const suggestionDisplay = suggestionFeed.join("\n\n────────\n\n");
+  const questionsDisplay = questionFeed.join("\n\n────────\n\n");
 
   return (
     <div className="flex h-[calc(100dvh-4.5rem)] min-h-[420px] flex-row bg-ink-950">
@@ -413,7 +427,7 @@ export function MeetingCopilot() {
       </aside>
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {/* Compact toolbar — keeps transcript / suggestion / notes high on the screen */}
+        {/* Compact toolbar — keeps transcript / suggestion / questions high on the screen */}
         <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-white/10 bg-ink-950/95 px-3 py-2 sm:gap-4 sm:px-4">
           <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3 gap-y-1">
             <h1 className="font-display truncate text-base font-bold text-white sm:text-lg">
@@ -505,10 +519,13 @@ export function MeetingCopilot() {
               <button
                 type="button"
                 onClick={() => {
+                  sessionIdRef.current =
+                    typeof crypto !== "undefined" && crypto.randomUUID
+                      ? crypto.randomUUID()
+                      : `sess-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
                   transcriptRef.current = "";
                   setTranscript("");
                   setSuggestionFeed([]);
-                  setLatestSuggestionText("");
                 }}
                 className="text-xs text-slate-500 hover:text-slate-300"
               >
@@ -556,41 +573,75 @@ export function MeetingCopilot() {
         <section className="flex min-h-[11rem] flex-col lg:min-h-0">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 px-4 py-3 sm:px-5">
             <h2 className="font-display text-xs font-bold uppercase tracking-wider text-slate-200 sm:text-sm">
-              Live notes
+              Questions
+              {questionBusy && (
+                <span className="ml-2 font-sans text-xs font-normal normal-case text-emerald-400/90">
+                  answering…
+                </span>
+              )}
             </h2>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                disabled={!latestSuggestionText.trim()}
-                onClick={appendSuggestionToNotes}
-                className="rounded-lg border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent-glow hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={questionBusy || !questionText.trim()}
+                onClick={() => void runAskQuestion()}
+                className="rounded-lg bg-emerald-600/90 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40 sm:px-4"
               >
-                Append suggestion
+                Ask
               </button>
               <button
                 type="button"
-                disabled={!notes.trim()}
-                onClick={saveNotes}
+                disabled={!questionText.trim()}
+                onClick={() => setQuestionText("")}
                 className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                Save
+                Clear input
               </button>
               <button
                 type="button"
-                onClick={() => setNotes("")}
-                className="text-xs text-slate-500 hover:text-slate-300"
+                disabled={!questionFeed.length}
+                onClick={() => setQuestionFeed([])}
+                className="text-xs text-slate-500 hover:text-slate-300 disabled:opacity-40"
               >
-                Clear
+                Clear answers
               </button>
             </div>
           </div>
+          <p className="shrink-0 border-b border-white/5 px-4 py-2 text-xs leading-relaxed text-slate-500 sm:px-5">
+            Ask anything—programming, tools, concepts—or something about the meeting. With a live
+            session, your briefing and transcript are sent when relevant.
+          </p>
+          <label className="sr-only" htmlFor="standalone-question">
+            Your question
+          </label>
           <textarea
-            id="live-notes"
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            className="min-h-0 flex-1 resize-none border-0 bg-ink-900/40 px-4 py-4 text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
-            placeholder="Your running notes: decisions, follow-ups, risks… Use “Append suggestion” to snapshot the current reply with a timestamp."
+            id="standalone-question"
+            value={questionText}
+            onChange={(e) => setQuestionText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                void runAskQuestion();
+              }
+            }}
+            placeholder="e.g. What’s the difference between async and await in TypeScript? (⌘/Ctrl+Enter to send)"
+            className="min-h-[5.5rem] shrink-0 resize-y border-b border-white/5 bg-ink-900/50 px-4 py-3 text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
           />
+          <div
+            id="questions-answer-scroll"
+            className="min-h-0 flex-1 overflow-y-auto bg-ink-950/80 px-4 py-4 sm:px-5"
+          >
+            {questionsDisplay ? (
+              <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-100">
+                {questionsDisplay}
+              </div>
+            ) : (
+              <p className="text-sm text-slate-600">
+                Answers appear here. General questions don’t need a recording; for meeting-related
+                questions, start the copilot so context can be included.
+              </p>
+            )}
+          </div>
         </section>
         </div>
       </div>

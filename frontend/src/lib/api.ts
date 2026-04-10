@@ -13,9 +13,16 @@ export type TranscribeResponse = {
   duration_sec: number;
 };
 
-export async function transcribeAudio(blob: Blob, filename: string): Promise<TranscribeResponse> {
+export async function transcribeAudio(
+  blob: Blob,
+  filename: string,
+  sessionId?: string | null
+): Promise<TranscribeResponse> {
   const form = new FormData();
   form.append("file", blob, filename);
+  if (sessionId) {
+    form.append("session_id", sessionId);
+  }
   const res = await fetch(apiUrl("/api/transcribe"), {
     method: "POST",
     body: form,
@@ -29,12 +36,38 @@ export async function transcribeAudio(blob: Blob, filename: string): Promise<Tra
 
 export async function suggestReply(
   transcript: string,
-  context?: string
+  context?: string,
+  sessionId?: string | null
 ): Promise<{ suggestion: string }> {
   const res = await fetch(apiUrl("/api/suggest"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ transcript, context: context || null }),
+    body: JSON.stringify({
+      transcript,
+      context: context || null,
+      session_id: sessionId || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || res.statusText);
+  }
+  return res.json();
+}
+
+export async function answerQuestion(
+  question: string,
+  context?: string,
+  sessionId?: string | null
+): Promise<{ answer: string }> {
+  const res = await fetch(apiUrl("/api/answer"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question,
+      context: context || null,
+      session_id: sessionId || null,
+    }),
   });
   if (!res.ok) {
     const err = await res.text();

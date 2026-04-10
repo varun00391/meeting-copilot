@@ -39,34 +39,40 @@ def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str,
     client = _get_client()
     ctx = (extra_context or "").strip()
     system = (
-        "You are an expert real-time meeting copilot. The user hears a live conversation and needs "
-        "accurate, relevant help responding out loud.\n\n"
+        "You are an expert real-time meeting copilot. The user hears a live conversation (full "
+        "chronological transcript may be provided) and needs help responding out loud.\n\n"
+        "Primary job — questions and requests:\n"
+        "- Detect whether the **most recent relevant turn** contains a **question** or a **clear "
+        "request for a response** (including implicit asks like “Can we confirm…?”, “What’s your "
+        "take?”, or a decision that clearly expects an answer).\n"
+        "- When a question or such a request exists, your main output must be a **direct answer** "
+        "the user can say — not generic coaching, not only “here’s a tactic” unless the question "
+        "was purely procedural. Address the substance: answer what was asked using facts from the "
+        "transcript; if the transcript does not contain enough information, say that honestly and "
+        "give a short, natural clarifying question they can ask.\n"
+        "- When **no** clear question or request appears in the latest relevant exchange, say so "
+        "briefly and offer **one** short optional line they could say (acknowledgment or bridge) "
+        "— do not fabricate that they were asked something.\n\n"
         "Meeting briefing (when provided):\n"
-        "- The user may paste a block describing their situation (who they are meeting, topic, "
-        "stakes), concrete goals or numbers (e.g. salary target), red lines, and what they want "
-        "from you: tone (confident, diplomatic), type of help (phrases to say, how to counter, "
-        "questions to ask), or pitfalls to avoid.\n"
-        "- Treat that briefing as mandatory steering for **Suggested reply**: align vocabulary, "
-        "stance, and tactics with it. Example: HR joiner discussion with a 30 LPA goal → help them "
-        "discuss comp professionally, anchor near their target when the transcript opens that "
-        "topic, without claiming the other side said things they did not.\n"
-        "- If the briefing conflicts with the transcript, the transcript wins for facts; use the "
-        "briefing for intent, tone, and what to optimize for.\n\n"
+        "- The user may describe situation, goals, tone, red lines, and what they want from you.\n"
+        "- Use the briefing to shape **tone, stance, and priorities** in **Direct reply**; the "
+        "transcript wins for facts. If briefing and transcript conflict on facts, follow the "
+        "transcript.\n\n"
         "Strict rules:\n"
         "- Ground everything in the transcript. Do not invent facts, names, numbers, dates, or "
-        "commitments that are not clearly supported by the text.\n"
-        "- Prioritize the most recent lines: explicit questions, requests, objections, or "
-        "decisions that need input. If multiple threads exist, address the newest one first.\n"
-        "- If the latest content is small talk, unclear, or needs clarification, say so in one "
-        "short sentence and give a neutral, honest follow-up question—not a made-up answer.\n"
-        "- Suggested speech must sound natural when read aloud: plain language, 2–5 sentences "
-        "for the reply block unless a shorter acknowledgment is clearly enough.\n\n"
+        "commitments not supported by the text.\n"
+        "- Prioritize the **newest** relevant exchange; if several questions stack, answer the "
+        "most recent one first.\n"
+        "- Speech must sound natural aloud: plain language, usually 2–6 sentences in **Direct "
+        "reply** when answering a question.\n\n"
         "Use exactly these section headings (markdown **bold**):\n"
-        "**Latest turn (facts):** — 1–2 sentences, only what the transcript shows about the last "
-        "relevant exchange.\n"
-        "**What they need from you:** — one precise sentence.\n"
-        "**Suggested reply (say this):** — what the user can speak verbatim or paraphrase; "
-        "directly serve their stated goals and expected style from the briefing when present."
+        "**Question or request detected:** — Yes or No, one short reason.\n"
+        "**What they asked (if any):** — Quote or tight paraphrase from the transcript, or "
+        "“None.”\n"
+        "**Direct reply (say this):** — If a question/request was detected: the substantive "
+        "answer or honest clarification they can speak. If none: say no question detected and "
+        "one optional short line.\n"
+        "**Optional:** — At most one line: risk, follow-up, or caveat (only if useful)."
     )
     user_msg = f"Transcript:\n{transcript[-12000:]}"
     if ctx:
@@ -74,7 +80,7 @@ def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str,
             "\n\n=== User meeting briefing (situation + what kind of help they want) ===\n"
             f"{ctx}\n"
             "=== End briefing ===\n"
-            "Use the briefing to shape stance, tone, and tactics in **Suggested reply**, while "
+            "Use the briefing to shape stance, tone, and tactics in **Direct reply**, while "
             "keeping claims tied to the transcript."
         )
     completion = client.chat.completions.create(
@@ -85,6 +91,67 @@ def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str,
         ],
         temperature=0.25,
         max_tokens=1024,
+    )
+    content = completion.choices[0].message.content or ""
+    usage_obj = completion.usage
+    usage = {}
+    if usage_obj:
+        usage = {
+            "prompt_tokens": usage_obj.prompt_tokens or 0,
+            "completion_tokens": usage_obj.completion_tokens or 0,
+            "total_tokens": usage_obj.total_tokens or 0,
+        }
+    return content.strip(), usage
+
+
+def answer_standalone_question_sync(
+    question: str,
+    meeting_transcript_excerpt: str | None,
+    briefing: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """
+    General Q&A (programming, definitions, how-to, etc.). Optional meeting excerpt/briefing
+    when the user may be asking about the live session.
+    """
+    client = _get_client()
+    q = (question or "").strip()
+    mt = (meeting_transcript_excerpt or "").strip()
+    br = (briefing or "").strip()
+    system = (
+        "You are a capable assistant. The user may ask about **any topic**: programming, tools, "
+        "concepts, math, writing, or general knowledge.\n\n"
+        "Rules:\n"
+        "- Answer the **user's question** directly and clearly. Prefer structured answers: short "
+        "intro, then bullets or numbered steps when helpful.\n"
+        "- For **code**, use fenced markdown blocks with a language tag when applicable. Keep "
+        "examples minimal and correct.\n"
+        "- If optional **meeting transcript** or **briefing** is provided below, use it **only** "
+        "when the question clearly relates to that meeting (people, decisions, numbers mentioned "
+        "there). If the question is unrelated (e.g. a pure programming question), **ignore** the "
+        "meeting material and answer the question on its own.\n"
+        "- Do not invent meeting facts. If the question needs meeting details that are not in the "
+        "excerpt, say what is missing and answer what you can.\n"
+        "- If you are uncertain, say so briefly and suggest how to verify.\n"
+        "- Be concise but complete; avoid filler."
+    )
+    user_parts = [f"Question:\n{q}"]
+    if mt:
+        user_parts.append(
+            "\n---\nOptional meeting transcript (use only if relevant to the question):\n" + mt[-12000:]
+        )
+    if br:
+        user_parts.append(
+            "\n---\nOptional user briefing (goals/tone; use only if relevant):\n" + br[:8000]
+        )
+    user_msg = "\n".join(user_parts)
+    completion = client.chat.completions.create(
+        model=settings.chat_model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.35,
+        max_tokens=2048,
     )
     content = completion.choices[0].message.content or ""
     usage_obj = completion.usage

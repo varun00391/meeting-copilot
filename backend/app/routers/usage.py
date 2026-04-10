@@ -126,7 +126,7 @@ async def usage_report(
                 total_tokens=tot,
             )
         )
-        if endpoint == "suggest":
+        if endpoint in ("suggest", "answer"):
             llm_req += reqs
             llm_in += in_t
             llm_out += out_t
