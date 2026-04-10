@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -8,7 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from app.config import settings
 from app.database import get_db
 from app.models import ConversationSession
-from app.services import conversation_service, deepgram_service, groq_service
+from app.services import conversation_service, deepgram_service, groq_service, rag_service
 
 router = APIRouter(prefix="/api", tags=["copilot"])
 
@@ -28,6 +30,15 @@ class SuggestBody(BaseModel):
         max_length=64,
         description="Server-side session id to load full stored transcript and briefing.",
     )
+    rag_mode: Literal["off", "auto", "on"] = Field(
+        "auto",
+        description="Same as /api/answer: optional retrieval from uploaded knowledge base.",
+    )
+    rag_keywords: str | None = Field(
+        None,
+        max_length=2000,
+        description="Comma-separated phrases; in auto mode, matching any triggers RAG for suggestions.",
+    )
 
 
 class SuggestResponse(BaseModel):
@@ -46,6 +57,15 @@ class AnswerBody(BaseModel):
         max_length=20_000,
         description="Meeting briefing from the client; overrides stored briefing when non-empty.",
     )
+    rag_mode: Literal["off", "auto", "on"] = Field(
+        "auto",
+        description="off=no retrieval; on=always use uploaded docs; auto=keywords or similarity",
+    )
+    rag_keywords: str | None = Field(
+        None,
+        max_length=2000,
+        description="Comma-separated phrases; in auto mode, matching any triggers RAG.",
+    )
 
 
 class AnswerResponse(BaseModel):
@@ -55,6 +75,7 @@ class AnswerResponse(BaseModel):
 @router.post("/transcribe", response_model=dict)
 async def transcribe(
     file: UploadFile = File(...),
+    file_tab: UploadFile | None = File(None),
     session_id: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -63,11 +84,18 @@ async def transcribe(
     raw = await file.read()
     if len(raw) > 24 * 1024 * 1024:
         raise HTTPException(413, "Audio file too large (max ~24MB)")
+    raw_tab: bytes | None = None
+    if file_tab and file_tab.filename:
+        raw_tab = await file_tab.read()
+        if len(raw_tab) > 24 * 1024 * 1024:
+            raise HTTPException(413, "Tab audio file too large (max ~24MB)")
     try:
         text, utterances, duration_sec = await run_in_threadpool(
             deepgram_service.transcribe_diarized_sync,
             raw,
+            raw_tab,
             content_type=file.content_type,
+            content_type_tab=file_tab.content_type if file_tab else None,
         )
     except ValueError as e:
         raise HTTPException(503, str(e)) from e
@@ -123,10 +151,25 @@ async def suggest(body: SuggestBody, db: AsyncSession = Depends(get_db)) -> Sugg
         merged = await conversation_service.transcript_for_llm(
             db, sid, body.transcript, max_chars=14000
         )
+        rag_context: str | None = None
+        if body.rag_mode != "off" and merged.strip():
+            rq = merged.strip()[-8000:]
+            rows = await rag_service.load_chunk_rows_for_retrieval(
+                db, rq, rag_mode=body.rag_mode
+            )
+            if rows:
+                rag_context = await run_in_threadpool(
+                    rag_service.compute_rag_context_from_rows,
+                    rq,
+                    body.rag_mode,
+                    body.rag_keywords,
+                    rows,
+                )
         suggestion, usage = await run_in_threadpool(
             groq_service.suggest_reply_sync,
             merged,
             ctx_for_llm or None,
+            rag_context,
         )
     except ValueError as e:
         raise HTTPException(503, str(e)) from e
@@ -159,12 +202,27 @@ async def answer_question(body: AnswerBody, db: AsyncSession = Depends(get_db)) 
         if row and row.transcript.strip():
             meeting_excerpt = row.transcript.strip()[-14000:]
 
+    rag_context: str | None = None
+    if body.rag_mode != "off":
+        rows = await rag_service.load_chunk_rows_for_retrieval(
+            db, body.question, rag_mode=body.rag_mode
+        )
+        if rows:
+            rag_context = await run_in_threadpool(
+                rag_service.compute_rag_context_from_rows,
+                body.question,
+                body.rag_mode,
+                body.rag_keywords,
+                rows,
+            )
+
     try:
         ans, usage = await run_in_threadpool(
             groq_service.answer_standalone_question_sync,
             body.question,
             meeting_excerpt,
             ctx_for_llm or None,
+            rag_context,
         )
     except ValueError as e:
         raise HTTPException(503, str(e)) from e

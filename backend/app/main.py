@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import init_db
-from app.routers import copilot, usage
+from app.routers import copilot, rag, usage
 
 
 @asynccontextmanager
@@ -31,6 +31,7 @@ app.add_middleware(
 )
 
 app.include_router(copilot.router)
+app.include_router(rag.router)
 app.include_router(usage.router)
 
 

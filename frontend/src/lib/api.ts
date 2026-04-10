@@ -14,12 +14,17 @@ export type TranscribeResponse = {
 };
 
 export async function transcribeAudio(
-  blob: Blob,
+  micBlob: Blob,
   filename: string,
-  sessionId?: string | null
+  sessionId?: string | null,
+  /** Separate tab/system-audio recording (mono). Enables reliable you vs remote speaker IDs. */
+  tabBlob?: Blob | null
 ): Promise<TranscribeResponse> {
   const form = new FormData();
-  form.append("file", blob, filename);
+  form.append("file", micBlob, filename);
+  if (tabBlob && tabBlob.size >= 200) {
+    form.append("file_tab", tabBlob, `tab-${filename}`);
+  }
   if (sessionId) {
     form.append("session_id", sessionId);
   }
@@ -34,10 +39,13 @@ export async function transcribeAudio(
   return res.json();
 }
 
+export type RagMode = "off" | "auto" | "on";
+
 export async function suggestReply(
   transcript: string,
   context?: string,
-  sessionId?: string | null
+  sessionId?: string | null,
+  options?: { ragMode?: RagMode; ragKeywords?: string | null }
 ): Promise<{ suggestion: string }> {
   const res = await fetch(apiUrl("/api/suggest"), {
     method: "POST",
@@ -46,6 +54,8 @@ export async function suggestReply(
       transcript,
       context: context || null,
       session_id: sessionId || null,
+      rag_mode: options?.ragMode ?? "auto",
+      rag_keywords: options?.ragKeywords?.trim() || null,
     }),
   });
   if (!res.ok) {
@@ -58,7 +68,8 @@ export async function suggestReply(
 export async function answerQuestion(
   question: string,
   context?: string,
-  sessionId?: string | null
+  sessionId?: string | null,
+  options?: { ragMode?: RagMode; ragKeywords?: string | null }
 ): Promise<{ answer: string }> {
   const res = await fetch(apiUrl("/api/answer"), {
     method: "POST",
@@ -67,6 +78,8 @@ export async function answerQuestion(
       question,
       context: context || null,
       session_id: sessionId || null,
+      rag_mode: options?.ragMode ?? "auto",
+      rag_keywords: options?.ragKeywords?.trim() || null,
     }),
   });
   if (!res.ok) {
@@ -74,6 +87,39 @@ export async function answerQuestion(
     throw new Error(err || res.statusText);
   }
   return res.json();
+}
+
+export type RagDocumentInfo = {
+  id: string;
+  filename: string;
+  topic_tags: string | null;
+  chunk_count: number;
+  created_at: string;
+};
+
+export async function fetchRagDocuments(): Promise<{ documents: RagDocumentInfo[] }> {
+  const res = await fetch(apiUrl("/api/rag/documents"));
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function uploadRagDocument(
+  file: File,
+  topicTags?: string
+): Promise<{ id: string; filename: string; topic_tags: string | null }> {
+  const form = new FormData();
+  form.append("file", file);
+  if (topicTags?.trim()) form.append("topic_tags", topicTags.trim());
+  const res = await fetch(apiUrl("/api/rag/upload"), { method: "POST", body: form });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function deleteRagDocument(id: string): Promise<void> {
+  const res = await fetch(apiUrl(`/api/rag/documents/${encodeURIComponent(id)}`), {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 export type DailyUsage = {

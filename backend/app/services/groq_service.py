@@ -35,9 +35,14 @@ async def log_usage(
     await db.commit()
 
 
-def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str, dict[str, Any]]:
+def suggest_reply_sync(
+    transcript: str,
+    extra_context: str | None,
+    rag_context: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     client = _get_client()
     ctx = (extra_context or "").strip()
+    rag = (rag_context or "").strip()
     system = (
         "You are an expert real-time meeting copilot. The user hears a live conversation (full "
         "chronological transcript may be provided) and needs help responding out loud.\n\n"
@@ -63,8 +68,17 @@ def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str,
         "commitments not supported by the text.\n"
         "- Prioritize the **newest** relevant exchange; if several questions stack, answer the "
         "most recent one first.\n"
+        "- **Programming and technical questions** (languages, APIs, debugging, algorithms, "
+        "commands, data structures): give a correct, concise answer in **Direct reply**. Use "
+        "markdown **fenced code blocks** with a language tag when showing code; keep snippets "
+        "short enough to read aloud or skim. If the ask is purely technical and not about "
+        "meeting dynamics, prioritize technical accuracy over generic meeting phrasing.\n"
         "- Speech must sound natural aloud: plain language, usually 2–6 sentences in **Direct "
-        "reply** when answering a question.\n\n"
+        "reply** when answering a question; for code-heavy replies, brief spoken setup plus the "
+        "code block is fine.\n"
+        "- If **retrieved document excerpts** are provided below, you may use them to ground "
+        "technical or policy **Direct reply** lines when they match the discussion; the transcript "
+        "still wins for what was actually said in the meeting.\n\n"
         "Use exactly these section headings (markdown **bold**):\n"
         "**Question or request detected:** — Yes or No, one short reason.\n"
         "**What they asked (if any):** — Quote or tight paraphrase from the transcript, or "
@@ -75,6 +89,12 @@ def suggest_reply_sync(transcript: str, extra_context: str | None) -> tuple[str,
         "**Optional:** — At most one line: risk, follow-up, or caveat (only if useful)."
     )
     user_msg = f"Transcript:\n{transcript[-12000:]}"
+    if rag:
+        user_msg += (
+            "\n\n=== Retrieved excerpts from user-uploaded documents (use when relevant to the "
+            "discussion or reply) ===\n"
+            + rag[:12000]
+        )
     if ctx:
         user_msg += (
             "\n\n=== User meeting briefing (situation + what kind of help they want) ===\n"
@@ -108,15 +128,17 @@ def answer_standalone_question_sync(
     question: str,
     meeting_transcript_excerpt: str | None,
     briefing: str | None,
+    rag_context: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     General Q&A (programming, definitions, how-to, etc.). Optional meeting excerpt/briefing
-    when the user may be asking about the live session.
+    when the user may be asking about the live session. Optional RAG excerpts from uploaded PDFs/DOCX.
     """
     client = _get_client()
     q = (question or "").strip()
     mt = (meeting_transcript_excerpt or "").strip()
     br = (briefing or "").strip()
+    rag = (rag_context or "").strip()
     system = (
         "You are a capable assistant. The user may ask about **any topic**: programming, tools, "
         "concepts, math, writing, or general knowledge.\n\n"
@@ -125,6 +147,10 @@ def answer_standalone_question_sync(
         "intro, then bullets or numbered steps when helpful.\n"
         "- For **code**, use fenced markdown blocks with a language tag when applicable. Keep "
         "examples minimal and correct.\n"
+        "- If **retrieved document excerpts** are provided below, treat them as **authoritative** "
+        "for facts about those documents. Cite or paraphrase them when answering questions they "
+        "cover. If the question is outside those excerpts, answer from general knowledge and say "
+        "when you are not using the documents.\n"
         "- If optional **meeting transcript** or **briefing** is provided below, use it **only** "
         "when the question clearly relates to that meeting (people, decisions, numbers mentioned "
         "there). If the question is unrelated (e.g. a pure programming question), **ignore** the "
@@ -135,6 +161,10 @@ def answer_standalone_question_sync(
         "- Be concise but complete; avoid filler."
     )
     user_parts = [f"Question:\n{q}"]
+    if rag:
+        user_parts.append(
+            "\n---\nRetrieved excerpts from user-uploaded documents (use when relevant):\n" + rag[:12000]
+        )
     if mt:
         user_parts.append(
             "\n---\nOptional meeting transcript (use only if relevant to the question):\n" + mt[-12000:]

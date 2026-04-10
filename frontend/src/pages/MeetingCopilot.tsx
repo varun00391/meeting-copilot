@@ -1,7 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { answerQuestion, suggestReply, transcribeAudio } from "../lib/api";
+import {
+  answerQuestion,
+  deleteRagDocument,
+  fetchRagDocuments,
+  type RagMode,
+  suggestReply,
+  transcribeAudio,
+  uploadRagDocument,
+} from "../lib/api";
 
 type Status = "idle" | "listening" | "error";
 
@@ -17,6 +25,60 @@ const SUGGEST_DEBOUNCE_MS = 400;
 
 /** Separates prepended transcript segments so we can reorder oldest→newest for the LLM. */
 const TRANSCRIPT_SEGMENT_SEP = "\n\n---\n\n";
+
+const COPILOT_MARKDOWN_PROSE_CLASS = [
+  "prose prose-invert prose-sm max-w-none",
+  "prose-headings:font-display prose-headings:font-semibold prose-headings:tracking-tight",
+  "prose-p:leading-relaxed prose-li:leading-relaxed",
+  "prose-pre:bg-ink-900 prose-pre:border prose-pre:border-white/10 prose-pre:rounded-lg",
+  "prose-code:rounded prose-code:bg-white/[0.08] prose-code:px-1.5 prose-code:py-0.5 prose-code:font-normal prose-code:text-accent-glow",
+  "prose-code:before:content-none prose-code:after:content-none",
+  "prose-table:border-collapse prose-th:border prose-th:border-white/15 prose-td:border prose-td:border-white/10",
+].join(" ");
+
+const copilotMarkdownComponents = {
+  a: ({
+    href,
+    children,
+    ...props
+  }: {
+    href?: string;
+    children?: ReactNode;
+    className?: string;
+  }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-accent-glow underline decoration-accent/50 underline-offset-2 hover:text-indigo-300"
+      {...props}
+    >
+      {children}
+    </a>
+  ),
+  pre: ({
+    children,
+    className,
+    ...props
+  }: {
+    children?: ReactNode;
+    className?: string;
+  }) => (
+    <pre {...props} className={[className, "overflow-x-auto"].filter(Boolean).join(" ")}>
+      {children}
+    </pre>
+  ),
+};
+
+function CopilotMarkdown({ markdown }: { markdown: string }) {
+  return (
+    <div className={COPILOT_MARKDOWN_PROSE_CLASS}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={copilotMarkdownComponents}>
+        {markdown}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 function toChronologicalForModel(displayTranscript: string): string {
   const t = displayTranscript.trim();
@@ -49,6 +111,8 @@ type QuestionEntry = {
 export function MeetingCopilot() {
   const [status, setStatus] = useState<Status>("idle");
   const [transcript, setTranscript] = useState("");
+  /** Raw textarea vs rendered Markdown preview (same text). */
+  const [transcriptView, setTranscriptView] = useState<"edit" | "preview">("edit");
   /** Newest suggestion first; each entry is timestamp + body. */
   const [suggestionFeed, setSuggestionFeed] = useState<string[]>([]);
   const [questionText, setQuestionText] = useState("");
@@ -60,21 +124,31 @@ export function MeetingCopilot() {
   const [questionBusy, setQuestionBusy] = useState(false);
   const [captureInfo, setCaptureInfo] = useState<CaptureInfo | null>(null);
   const [briefingOpen, setBriefingOpen] = useState(false);
+  /** RAG: uploaded docs list, optional topic tags on next upload, retrieval mode + keyword triggers */
+  const [ragDocuments, setRagDocuments] = useState<
+    { id: string; filename: string; topic_tags: string | null; chunk_count: number }[]
+  >([]);
+  const [ragUploadTopicTags, setRagUploadTopicTags] = useState("");
+  const [ragUploadBusy, setRagUploadBusy] = useState(false);
+  const [ragMode, setRagMode] = useState<RagMode>("auto");
+  const [ragKeywords, setRagKeywords] = useState("");
 
-  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recorderMicRef = useRef<MediaRecorder | null>(null);
+  const recorderTabRef = useRef<MediaRecorder | null>(null);
   const listeningRef = useRef(false);
-  const mergedStreamRef = useRef<MediaStream | null>(null);
   const recorderMimeRef = useRef("audio/webm");
   const segmentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  /** Tab/system audio only (when screen is shared). Recorded separately from mic for diarization. */
+  const tabAudioStreamRef = useRef<MediaStream | null>(null);
   const displayStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
   const transcriptRef = useRef("");
   const contextRef = useRef("");
   /** Server-side conversation session (transcript + briefing); set on Start, cleared on Stop. */
   const sessionIdRef = useRef<string | null>(null);
   const suggestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ragFileInputRef = useRef<HTMLInputElement | null>(null);
 
   transcriptRef.current = transcript;
   contextRef.current = context;
@@ -92,7 +166,8 @@ export function MeetingCopilot() {
       const { suggestion: s } = await suggestReply(
         t,
         contextRef.current || undefined,
-        sessionIdRef.current
+        sessionIdRef.current,
+        { ragMode, ragKeywords: ragKeywords || null }
       );
       const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const block = `[${stamp}]\n\n${s.trim()}`;
@@ -102,7 +177,7 @@ export function MeetingCopilot() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [ragMode, ragKeywords]);
 
   const scheduleLiveSuggest = useCallback(
     (fullTranscript: string) => {
@@ -116,11 +191,16 @@ export function MeetingCopilot() {
   );
 
   const processBlob = useCallback(
-    async (blob: Blob) => {
-      if (blob.size < 200) return;
-      const ext = extensionForRecorderMime(blob.type || recorderMimeRef.current);
+    async (micBlob: Blob, tabBlob: Blob | null) => {
+      if (micBlob.size < 200) return;
+      const ext = extensionForRecorderMime(micBlob.type || recorderMimeRef.current);
       try {
-        const res = await transcribeAudio(blob, `segment.${ext}`, sessionIdRef.current);
+        const res = await transcribeAudio(
+          micBlob,
+          `segment.${ext}`,
+          sessionIdRef.current,
+          tabBlob && tabBlob.size >= 200 ? tabBlob : null
+        );
         const lines: string[] = [];
         if (res.utterances?.length) {
           for (const u of res.utterances) {
@@ -146,26 +226,57 @@ export function MeetingCopilot() {
   );
 
   const beginSegment = useCallback(() => {
-    const merged = mergedStreamRef.current;
-    if (!merged || !listeningRef.current) return;
+    const mic = micStreamRef.current;
+    if (!mic || !listeningRef.current) return;
 
+    const tabOnly = tabAudioStreamRef.current;
     const mime = recorderMimeRef.current;
-    const chunks: Blob[] = [];
-    const rec = new MediaRecorder(merged, { mimeType: mime });
-    recorderRef.current = rec;
+    const chunksMic: Blob[] = [];
+    const chunksTab: Blob[] = [];
 
-    rec.ondataavailable = (ev) => {
-      if (ev.data.size) chunks.push(ev.data);
-    };
-    rec.onstop = () => {
-      recorderRef.current = null;
-      const blob = new Blob(chunks, { type: mime });
-      if (blob.size >= 200) void processBlob(blob);
+    const recMic = new MediaRecorder(mic, { mimeType: mime });
+    const recTab =
+      tabOnly && tabOnly.getAudioTracks().length > 0
+        ? new MediaRecorder(tabOnly, { mimeType: mime })
+        : null;
+
+    recorderMicRef.current = recMic;
+    recorderTabRef.current = recTab;
+
+    let micStopped = false;
+    let tabStopped = !recTab;
+
+    const finishSegment = () => {
+      if (!micStopped || !tabStopped) return;
+      recorderMicRef.current = null;
+      recorderTabRef.current = null;
+      const blobMic = new Blob(chunksMic, { type: mime });
+      const blobTab = recTab ? new Blob(chunksTab, { type: mime }) : null;
+      if (blobMic.size >= 200) void processBlob(blobMic, blobTab);
       if (listeningRef.current) beginSegment();
     };
 
+    recMic.ondataavailable = (ev) => {
+      if (ev.data.size) chunksMic.push(ev.data);
+    };
+    recMic.onstop = () => {
+      micStopped = true;
+      finishSegment();
+    };
+
+    if (recTab) {
+      recTab.ondataavailable = (ev) => {
+        if (ev.data.size) chunksTab.push(ev.data);
+      };
+      recTab.onstop = () => {
+        tabStopped = true;
+        finishSegment();
+      };
+    }
+
     try {
-      rec.start();
+      recMic.start();
+      recTab?.start();
     } catch {
       setError("Could not start audio recorder for this browser/format.");
       listeningRef.current = false;
@@ -174,9 +285,16 @@ export function MeetingCopilot() {
 
     segmentTimerRef.current = setTimeout(() => {
       segmentTimerRef.current = null;
-      if (rec.state === "recording") {
+      if (recMic.state === "recording") {
         try {
-          rec.stop();
+          recMic.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (recTab && recTab.state === "recording") {
+        try {
+          recTab.stop();
         } catch {
           /* ignore */
         }
@@ -197,16 +315,25 @@ export function MeetingCopilot() {
       suggestTimerRef.current = null;
     }
 
-    const r = recorderRef.current;
-    if (r && r.state !== "inactive") {
+    const rm = recorderMicRef.current;
+    if (rm && rm.state !== "inactive") {
       try {
-        r.stop();
+        rm.stop();
       } catch {
         /* ignore */
       }
     }
-    recorderRef.current = null;
-    mergedStreamRef.current = null;
+    recorderMicRef.current = null;
+    const rt = recorderTabRef.current;
+    if (rt && rt.state !== "inactive") {
+      try {
+        rt.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    recorderTabRef.current = null;
+    tabAudioStreamRef.current = null;
 
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
@@ -217,12 +344,6 @@ export function MeetingCopilot() {
     if (hiddenVideoRef.current) {
       hiddenVideoRef.current.srcObject = null;
     }
-
-    const ctx = audioContextRef.current;
-    if (ctx && ctx.state !== "closed") {
-      void ctx.close();
-    }
-    audioContextRef.current = null;
 
     setCaptureInfo(null);
   }, []);
@@ -263,34 +384,25 @@ export function MeetingCopilot() {
     }
     displayStreamRef.current = displayStream;
 
-    const audioCtx = new AudioContext();
-    audioContextRef.current = audioCtx;
-    await audioCtx.resume();
-
-    const dest = audioCtx.createMediaStreamDestination();
-    const micSource = audioCtx.createMediaStreamSource(micStream);
-    micSource.connect(dest);
-
     let hasTabAudio = false;
     if (displayStream) {
       const aTracks = displayStream.getAudioTracks();
       if (aTracks.length > 0) {
-        const tabAudioStream = new MediaStream(aTracks);
-        const tabSource = audioCtx.createMediaStreamSource(tabAudioStream);
-        tabSource.connect(dest);
+        tabAudioStreamRef.current = new MediaStream(aTracks);
         hasTabAudio = true;
+      } else {
+        tabAudioStreamRef.current = null;
       }
       const v = displayStream.getVideoTracks()[0];
       if (v && hiddenVideoRef.current) {
         hiddenVideoRef.current.srcObject = displayStream;
         void hiddenVideoRef.current.play().catch(() => {});
       }
+    } else {
+      tabAudioStreamRef.current = null;
     }
 
     setCaptureInfo({ hasMic: true, hasTabAudio });
-
-    const merged = dest.stream;
-    mergedStreamRef.current = merged;
 
     const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
@@ -312,10 +424,47 @@ export function MeetingCopilot() {
 
   useEffect(() => () => cleanupStreams(), [cleanupStreams]);
 
+  const refreshRagDocuments = useCallback(async () => {
+    try {
+      const { documents } = await fetchRagDocuments();
+      setRagDocuments(documents);
+    } catch {
+      /* ignore list errors */
+    }
+  }, []);
+
   useEffect(() => {
-    const el = document.getElementById("live-transcript") as HTMLTextAreaElement | null;
-    if (el) el.scrollTop = 0;
-  }, [transcript]);
+    void refreshRagDocuments();
+  }, [refreshRagDocuments]);
+
+  const onRagFileSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+      setRagUploadBusy(true);
+      setError(null);
+      try {
+        await uploadRagDocument(file, ragUploadTopicTags || undefined);
+        await refreshRagDocuments();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Upload failed");
+      } finally {
+        setRagUploadBusy(false);
+      }
+    },
+    [ragUploadTopicTags, refreshRagDocuments]
+  );
+
+  useEffect(() => {
+    if (transcriptView === "edit") {
+      const el = document.getElementById("live-transcript") as HTMLTextAreaElement | null;
+      if (el) el.scrollTop = 0;
+    } else {
+      const el = document.getElementById("live-transcript-preview");
+      if (el) el.scrollTop = 0;
+    }
+  }, [transcript, transcriptView]);
 
   useEffect(() => {
     const el = document.getElementById("live-suggestion-scroll");
@@ -358,7 +507,12 @@ export function MeetingCopilot() {
     setQuestionBusy(true);
     setError(null);
     try {
-      const { answer } = await answerQuestion(q, contextRef.current || undefined, sessionIdRef.current);
+      const { answer } = await answerQuestion(
+        q,
+        contextRef.current || undefined,
+        sessionIdRef.current,
+        { ragMode, ragKeywords: ragKeywords || null }
+      );
       const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       setQuestionFeed((prev) => [
         {
@@ -375,9 +529,11 @@ export function MeetingCopilot() {
     } finally {
       setQuestionBusy(false);
     }
-  }, [questionText]);
+  }, [questionText, ragMode, ragKeywords]);
 
-  const suggestionDisplay = suggestionFeed.join("\n\n────────\n\n");
+  const transcriptPreviewSegments = transcript.trim()
+    ? transcript.split(TRANSCRIPT_SEGMENT_SEP).filter(Boolean)
+    : [];
 
   return (
     <div className="flex h-[calc(100dvh-4.5rem)] min-h-[420px] flex-row bg-ink-950">
@@ -429,6 +585,100 @@ export function MeetingCopilot() {
                 }
                 className="min-h-[200px] flex-1 resize-y rounded-lg border border-white/10 bg-ink-950/90 px-3 py-2.5 text-sm leading-relaxed text-white placeholder:text-slate-600 focus:border-accent/50 focus:outline-none focus:ring-1 focus:ring-accent/40"
               />
+
+              <div className="border-t border-white/10 pt-3">
+                <p className="mb-2 font-display text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  Knowledge base (RAG)
+                </p>
+                <p className="mb-2 text-[11px] leading-relaxed text-slate-500">
+                  Upload PDF or DOCX once; embeddings are stored and reused. Leave file topics empty to
+                  search by similarity; with topics set, in <span className="text-slate-400">auto</span>{" "}
+                  mode a chunk is used only if the question mentions a topic or matches strongly.
+                </p>
+                <input
+                  ref={ragFileInputRef}
+                  type="file"
+                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  className="hidden"
+                  onChange={onRagFileSelected}
+                />
+                <label className="mb-2 block text-[11px] text-slate-500" htmlFor="rag-upload-topics">
+                  Topics for next upload (optional, comma-separated)
+                </label>
+                <input
+                  id="rag-upload-topics"
+                  type="text"
+                  value={ragUploadTopicTags}
+                  onChange={(e) => setRagUploadTopicTags(e.target.value)}
+                  placeholder="e.g. data leakage, compliance"
+                  className="mb-2 w-full rounded border border-white/10 bg-ink-950/90 px-2 py-1.5 text-xs text-white placeholder:text-slate-600"
+                />
+                <button
+                  type="button"
+                  disabled={ragUploadBusy}
+                  onClick={() => ragFileInputRef.current?.click()}
+                  className="mb-3 w-full rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs font-semibold text-accent-glow hover:bg-accent/20 disabled:opacity-50"
+                >
+                  {ragUploadBusy ? "Uploading…" : "Upload PDF or DOCX"}
+                </button>
+                {ragDocuments.length > 0 && (
+                  <ul className="mb-3 max-h-28 space-y-1 overflow-y-auto text-[11px] text-slate-400">
+                    {ragDocuments.map((d) => (
+                      <li
+                        key={d.id}
+                        className="flex items-start justify-between gap-1 border-b border-white/5 pb-1"
+                      >
+                        <span className="min-w-0 break-words" title={d.filename}>
+                          {d.filename}
+                          {d.chunk_count > 0 ? (
+                            <span className="text-slate-600"> · {d.chunk_count} chunks</span>
+                          ) : null}
+                        </span>
+                        <button
+                          type="button"
+                          className="shrink-0 text-rose-400 hover:text-rose-300"
+                          onClick={() => {
+                            void (async () => {
+                              try {
+                                await deleteRagDocument(d.id);
+                                await refreshRagDocuments();
+                              } catch (err) {
+                                setError(err instanceof Error ? err.message : "Delete failed");
+                              }
+                            })();
+                          }}
+                        >
+                          ×
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <label className="mb-1 block text-[11px] text-slate-500" htmlFor="rag-mode">
+                  Use documents for answers & live suggestions
+                </label>
+                <select
+                  id="rag-mode"
+                  value={ragMode}
+                  onChange={(e) => setRagMode(e.target.value as RagMode)}
+                  className="mb-2 w-full rounded border border-white/10 bg-ink-950/90 px-2 py-1.5 text-xs text-white"
+                >
+                  <option value="off">Off — model only</option>
+                  <option value="auto">Auto — topics / similarity</option>
+                  <option value="on">On — always search uploads</option>
+                </select>
+                <label className="mb-1 block text-[11px] text-slate-500" htmlFor="rag-keywords">
+                  Extra trigger phrases (auto mode, comma-separated)
+                </label>
+                <textarea
+                  id="rag-keywords"
+                  value={ragKeywords}
+                  onChange={(e) => setRagKeywords(e.target.value)}
+                  rows={2}
+                  placeholder="If the question or live topic contains any of these, search your documents first."
+                  className="w-full resize-none rounded border border-white/10 bg-ink-950/90 px-2 py-1.5 text-xs text-white placeholder:text-slate-600"
+                />
+              </div>
             </div>
           </>
         ) : (
@@ -503,7 +753,9 @@ export function MeetingCopilot() {
             </span>
             {captureInfo && status === "listening" && (
               <span className="hidden text-xs text-slate-500 sm:inline">
-                {captureInfo.hasTabAudio ? "Tab audio" : "Mic only"}
+                {captureInfo.hasTabAudio
+                  ? "Dual capture: speakers 0–99 = mic · 100+ = tab/meeting"
+                  : "Mic only · multiple voices via diarization"}
               </span>
             )}
             <button
@@ -529,7 +781,31 @@ export function MeetingCopilot() {
             <h2 className="font-display text-xs font-bold uppercase tracking-wider text-slate-200 sm:text-sm">
               Live transcript
             </h2>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex rounded-lg border border-white/10 p-0.5 text-[11px] font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setTranscriptView("edit")}
+                  className={`rounded-md px-2 py-1 ${
+                    transcriptView === "edit"
+                      ? "bg-white/15 text-white"
+                      : "text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTranscriptView("preview")}
+                  className={`rounded-md px-2 py-1 ${
+                    transcriptView === "preview"
+                      ? "bg-white/15 text-white"
+                      : "text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  Preview
+                </button>
+              </div>
               <button
                 type="button"
                 disabled={!transcript.trim()}
@@ -555,13 +831,39 @@ export function MeetingCopilot() {
               </button>
             </div>
           </div>
-          <textarea
-            id="live-transcript"
-            value={transcript}
-            onChange={(e) => onTranscriptChange(e.target.value)}
-            className="min-h-0 flex-1 resize-none border-0 bg-ink-950/50 px-4 py-4 font-mono text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
-            placeholder="Newest transcript segments appear at the top (older below). Separator --- between auto-captured segments."
-          />
+          {transcriptView === "edit" ? (
+            <textarea
+              id="live-transcript"
+              value={transcript}
+              onChange={(e) => onTranscriptChange(e.target.value)}
+              className="min-h-0 flex-1 resize-none border-0 bg-ink-950/50 px-4 py-4 font-mono text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
+              placeholder="Newest transcript segments appear at the top (older below). Separator --- between auto-captured segments."
+            />
+          ) : (
+            <div
+              id="live-transcript-preview"
+              className="min-h-0 flex-1 overflow-y-auto bg-ink-950/50 px-4 py-4 sm:px-5"
+            >
+              {transcriptPreviewSegments.length > 0 ? (
+                <div className="flex flex-col gap-4">
+                  {transcriptPreviewSegments.map((seg, i) => (
+                    <div key={i}>
+                      {i > 0 ? (
+                        <div
+                          className="mb-4 border-t border-white/10 pt-4"
+                          role="separator"
+                          aria-hidden
+                        />
+                      ) : null}
+                      <CopilotMarkdown markdown={seg.trim()} />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-600">Nothing to preview yet.</p>
+              )}
+            </div>
+          )}
         </section>
 
         <section className="flex min-h-[11rem] flex-col lg:min-h-0">
@@ -579,9 +881,20 @@ export function MeetingCopilot() {
             id="live-suggestion-scroll"
             className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-indigo-500/[0.06] to-ink-950 px-4 py-4 sm:px-5"
           >
-            {suggestionDisplay ? (
-              <div className="whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
-                {suggestionDisplay}
+            {suggestionFeed.length > 0 ? (
+              <div className="flex flex-col gap-6">
+                {suggestionFeed.map((block, i) => (
+                  <div key={i}>
+                    {i > 0 ? (
+                      <div
+                        className="mb-6 border-t border-white/10"
+                        role="separator"
+                        aria-hidden
+                      />
+                    ) : null}
+                    <CopilotMarkdown markdown={block} />
+                  </div>
+                ))}
               </div>
             ) : (
               <p className="text-sm text-slate-600">
@@ -641,12 +954,13 @@ export function MeetingCopilot() {
             value={questionText}
             onChange={(e) => setQuestionText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
+              if (e.key !== "Enter" || e.shiftKey) return;
+              e.preventDefault();
+              if (!questionBusy && questionText.trim()) {
                 void runAskQuestion();
               }
             }}
-            placeholder="e.g. What’s the difference between async and await in TypeScript? (⌘/Ctrl+Enter to send)"
+            placeholder="e.g. What’s the difference between async and await in TypeScript? (Enter to send · Shift+Enter for a new line)"
             className="min-h-[5.5rem] shrink-0 resize-y border-b border-white/5 bg-ink-900/50 px-4 py-3 text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-0 sm:px-5"
           />
           <div
@@ -665,44 +979,7 @@ export function MeetingCopilot() {
                       <span className="font-semibold text-slate-200">Q: </span>
                       {entry.question}
                     </p>
-                    <div
-                      className={[
-                        "prose prose-invert prose-sm max-w-none",
-                        "prose-headings:font-display prose-headings:font-semibold prose-headings:tracking-tight",
-                        "prose-p:leading-relaxed prose-li:leading-relaxed",
-                        "prose-pre:bg-ink-900 prose-pre:border prose-pre:border-white/10 prose-pre:rounded-lg",
-                        "prose-code:rounded prose-code:bg-white/[0.08] prose-code:px-1.5 prose-code:py-0.5 prose-code:font-normal prose-code:text-accent-glow",
-                        "prose-code:before:content-none prose-code:after:content-none",
-                        "prose-table:border-collapse prose-th:border prose-th:border-white/15 prose-td:border prose-td:border-white/10",
-                      ].join(" ")}
-                    >
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={{
-                          a: ({ href, children, ...props }) => (
-                            <a
-                              href={href}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-accent-glow underline decoration-accent/50 underline-offset-2 hover:text-indigo-300"
-                              {...props}
-                            >
-                              {children}
-                            </a>
-                          ),
-                          pre: ({ children, className, ...props }) => (
-                            <pre
-                              {...props}
-                              className={[className, "overflow-x-auto"].filter(Boolean).join(" ")}
-                            >
-                              {children}
-                            </pre>
-                          ),
-                        }}
-                      >
-                        {entry.answer}
-                      </ReactMarkdown>
-                    </div>
+                    <CopilotMarkdown markdown={entry.answer} />
                   </article>
                 ))}
               </div>
